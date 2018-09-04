@@ -1,0 +1,30 @@
+[[source]]
+url = "https://pypi.org/simple"
+verify_ssl = true
+name = "pypi"
+
+[packages]
+flask = "*"
+flask-restplus = "*"
+flask-migrate = "*"
+coverage = "*"
+marshmallow = "*"
+numpy = "*"
+psycopg2 = "*"
+pyjwt = "*"
+pytest = "*"
+pytest-cov = "*"
+python-dotenv = "*"
+cryptography = "*"
+cloudinary = "*"
+flask-excel = "*"
+humps = "*"
+flask-cors = "*"
+flatten-dict = "*"
+
+[dev-packages]
+pylint = "*"
+yapf = "*"
+
+[requires]
+python_version = "3.6.5"

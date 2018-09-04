@@ -1,0 +1,284 @@
+default: &defaults
+  docker:
+      - image: gcr.io/${GCLOUD_ACTIVO_PROJECT}/activo-api-ci-image
+        auth:
+          username: _json_key
+          password: '${SERVICE_ACCOUNT}'
+        environment:
+          ACTIVO_PATH: /home/circleci/activo-api
+          CC_TEST_REPORTER_ID: ${CC_TEST_REPORTER_ID}
+          FLASK_ENV: testing
+          FLASK_APP: manage.py
+          PGUSER: circleci
+          PG_HOST: localhost
+          TEST_DATABASE_URL: postgresql://circleci@localhost/circlecidb
+      - image: postgres:9.6
+        environment:
+          POSTGRES_USER: circleci
+          POSTGRES_DB: activo_test
+          POSTGRES_PASSWORD: ''
+  # specify working directory
+  working_directory: ~/activo-api
+
+release_default: &release_defaults
+  docker:
+    - image: gcr.io/${GCLOUD_ACTIVO_PROJECT}/activo-api-ci-image
+      auth:
+        username: _json_key
+        password: '${SERVICE_ACCOUNT}'
+  working_directory: ~/activo-api
+
+cmd_wait_for_postgres: &cmd_wait_for_postgres
+  run:
+    name: Waiting for Postgres to be ready
+    command: |
+      dockerize -wait tcp://localhost:5432 -timeout 1m
+cmd_install_dependencies: &cmd_install_dependencies
+  run:
+    name: Install dependencies
+    command: |
+      curl -L https://raw.githubusercontent.com/pyenv/pyenv-installer/master/bin/pyenv-installer | bash
+      export PATH="/home/circleci/.pyenv/bin:$PATH"
+      eval "$(pyenv init -)"
+      eval "$(pyenv virtualenv-init -)"
+      pyenv install 3.6.5 -s
+      pyenv local 3.6.5
+      pip3 install --user pipenv
+      python3 -m pipenv install
+
+cmd_install_dependencies: &cmd_save_cache
+    save_cache:
+        key: api-dependencies-{{ checksum "Pipfile.lock" }}
+        paths:
+          - $(python3 -m pipenv --venv)
+
+cmd_restore_cache: &cmd_restore_cache
+    restore_cache:
+        keys:
+          - api-dependencies-{{ checksum "Pipfile.lock" }}
+          # fallback to using the latest cache if no exact match is found
+          - api-dependencies-
+
+cmd_download_cc_test_reporter: &cmd_download_cc_test_reporter
+  run:
+    name:  Download cc-test-reporter
+    command: |
+      mkdir -p tmp/
+      curl -L https://codeclimate.com/downloads/test-reporter/test-reporter-latest-linux-amd64 > /tmp/cc-test-reporter
+      chmod +x /tmp/cc-test-reporter  
+
+cmd_attach_workspace: &cmd_attach_workspace
+  attach_workspace:
+    at: tmp/  
+
+# Python CircleCI 2.0 configuration file
+version: 2
+jobs:
+  build:
+    <<: *defaults
+    steps:
+      - checkout
+      - *cmd_install_dependencies
+      - *cmd_save_cache
+      - *cmd_wait_for_postgres
+      - run:
+          name: Set up database
+          command: |
+            source $(python3 -m pipenv --venv)/bin/activate
+            # flask db init
+            # flask db migrate
+            flask db upgrade
+      - *cmd_download_cc_test_reporter
+  run_tests:
+    <<: *defaults
+    steps:
+      - checkout
+      - *cmd_attach_workspace
+      - *cmd_install_dependencies
+      - *cmd_save_cache
+      - *cmd_wait_for_postgres
+      - *cmd_restore_cache
+      - *cmd_download_cc_test_reporter
+      - run:
+          name: Run tests
+          command: |
+            source $(python3 -m pipenv --venv)/bin/activate
+            pytest --cov=api/ tests --cov-report xml
+            /tmp/cc-test-reporter format-coverage coverage.xml -t "coverage.py" -o "tmp/cc.testreport.json"
+
+      - persist_to_workspace:
+          root: tmp/
+          paths:
+            - cc.testreport.json
+
+  upload_coverage:
+    <<: *defaults
+    steps:
+      - checkout
+      - *cmd_download_cc_test_reporter
+      - *cmd_attach_workspace
+      - run:
+          name: Upload coverage results to Code Climate
+          command: |
+            /tmp/cc-test-reporter upload-coverage -i tmp/cc.testreport.json
+
+  bake_image:
+      <<: *defaults
+      steps:
+        - checkout
+        - run:
+            name: bake image
+            command: |
+                  if [[ "${CIRCLE_BRANCH}" == "develop" ||  "${CIRCLE_BRANCH}" == "master" ]]; then
+                    bash .circleci/bake.sh
+                  fi
+        - persist_to_workspace:
+            root: workspace
+            paths:
+              - output
+
+  bake_image_sandbox:
+      <<: *defaults
+      steps:
+        - checkout
+        - run:
+            name: bake image
+            command: |
+                  if [[ "${CIRCLE_BRANCH}" =~ "sandbox" ]]; then
+                    bash .circleci/bake.sh
+                  fi
+        - persist_to_workspace:
+            root: workspace
+            paths:
+              - output
+
+  release_to_sandbox:
+    <<: *release_defaults
+    steps:
+      - run: exit 0
+
+  release_to_staging:
+    <<: *release_defaults
+    steps:
+      - run: exit 0
+
+  release_to_production:
+    <<: *release_defaults
+    steps:
+      - run: exit 0
+
+  deploy_sandbox:
+    <<: *defaults
+    steps:
+      - checkout
+      - attach_workspace:
+          at: ~/activo-api/workspace
+      - deploy:
+          name: Deploy service
+          command: |
+            if [[ "${CIRCLE_BRANCH}" != "master" || "${CIRCLE_BRANCH}" != "develop" ]]; then
+              bash .circleci/deploy.sh
+            fi
+
+  deploy_staging:
+    <<: *defaults
+    steps:
+      - checkout
+      - attach_workspace:
+          at: ~/activo-api/workspace
+      - deploy:
+          name: Deploy service
+          command: |
+            if [ "${CIRCLE_BRANCH}" == "develop" ]; then
+              bash .circleci/deploy.sh
+            fi
+  
+  deploy_production:
+    <<: *defaults
+    steps:
+      - checkout
+      - attach_workspace:
+          at: ~/activo-api/workspace
+      - deploy:
+          name: Deploy service
+          command: |
+            if [ "${CIRCLE_BRANCH}" == "master" ]; then
+              bash .circleci/deploy.sh
+            fi
+
+workflows:
+  version: 2
+  build_and_test:
+    jobs:
+      - build
+      - run_tests:
+          requires:
+            - build
+      - upload_coverage:
+          requires:
+            - run_tests
+      - bake_image:
+          filters:
+            branches:
+              only:
+                - master
+                - develop
+            tags:
+              only:
+                - /v[0-9]+(\.[0-9]+)*/
+      - bake_image_sandbox:
+          filters:
+            branches:
+              only:
+                - /^(.*?(\bsandbox\b)[^$]*)$/
+      - release_to_sandbox:
+          requires:
+            - run_tests
+            - bake_image_sandbox
+          filters:
+            branches:
+              only: /^(.*?(\bsandbox\b)[^$]*)$/     
+      - deploy_sandbox:
+          requires:
+            - release_to_sandbox
+          filters:
+            branches:
+              only: /^(.*?(\bsandbox\b)[^$]*)$/
+      - release_to_staging:
+          requires:
+            - upload_coverage
+            - bake_image
+          filters:
+            branches:
+              only: develop
+            tags:
+              only:
+                - /v[0-9]+(\.[0-9]+)*/
+      - deploy_staging:
+          requires:
+            - release_to_staging
+          filters:
+            branches:
+              only: develop
+            tags:
+              only:
+                - /v[0-9]+(\.[0-9]+)*/
+      - release_to_production:
+          requires:
+            - upload_coverage
+            - bake_image
+          filters:
+            branches:
+              only: master
+            tags:
+              only:
+                - /v[0-9]+(\.[0-9]+)*/
+      - deploy_production:
+          requires:
+            - release_to_production
+          filters:
+            branches:
+              only: master
+            tags:
+              only:
+                - /v[0-9]+(\.[0-9]+)*/
